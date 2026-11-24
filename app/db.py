@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -76,6 +77,82 @@ class ArchiveUnavailable(Exception):
 
 class ArchiveCorrupt(Exception):
     """A stored archive failed its integrity checks."""
+
+
+# Stored temperature values live in the same tenth-of-a-degree range as the
+# write-side request model.
+_MIN_TENTHS_C = -10_000
+_MAX_TENTHS_C = 50_000
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _strict_int(value: object, *, what: str, run_id: object) -> int:
+    """Return ``value`` only when it is a genuine JSON/SQLite integer.
+
+    ``bool`` is a subclass of ``int`` in Python and floats such as ``1.5`` are
+    silently truncated by ``int(...)``; both would let a tampered row smuggle a
+    non-integer through validation, so they are rejected explicitly.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ArchiveCorrupt(
+            f"archive {run_id!r} field {what!r} must be an integer, got "
+            f"{type(value).__name__}"
+        )
+    return value
+
+
+def _strict_str(value: object, *, what: str, run_id: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ArchiveCorrupt(
+            f"archive {run_id!r} field {what!r} must be a non-empty string"
+        )
+    return value
+
+
+def _corrupt_run_id(value: object) -> str:
+    """Best-effort label for a corrupt row whose run id may itself be invalid."""
+    if isinstance(value, str) and value:
+        return value
+    return f"<unparseable:{value!r}>"
+
+
+def _load_int_pair_list(
+    raw: object,
+    *,
+    what: str,
+    run_id: object,
+) -> list[list[int]]:
+    """Parse a JSON payload that must be a list of exact two-int arrays."""
+    if not isinstance(raw, list):
+        raise ArchiveCorrupt(
+            f"archive {run_id!r} field {what!r} must be a JSON array"
+        )
+    parsed: list[list[int]] = []
+    for item in raw:
+        if not isinstance(item, list) or len(item) != 2:
+            raise ArchiveCorrupt(
+                f"archive {run_id!r} field {what!r} entries must be "
+                "two-element arrays"
+            )
+        first = _strict_int(item[0], what=f"{what}[0]", run_id=run_id)
+        second = _strict_int(item[1], what=f"{what}[1]", run_id=run_id)
+        parsed.append([first, second])
+    return parsed
+
+
+@dataclass(frozen=True)
+class RecentArchives:
+    """One snapshot's worth of list-query results.
+
+    ``archives`` holds at most ``limit`` archives that passed every integrity
+    check; ``skipped_run_ids`` lists the corrupt runs that had to be skipped to
+    collect them, in list order (newest first, run id on ties).
+    """
+
+    archives: tuple[StoredArchive, ...]
+    skipped_run_ids: tuple[str, ...]
+    limit: int
+    exhausted: bool
 
 
 @dataclass(frozen=True)
@@ -359,70 +436,147 @@ class ArchiveStore:
             pass
 
     def _row_to_archive(self, row: sqlite3.Row) -> StoredArchive:
+        # run_id is a TEXT PRIMARY KEY; it is needed to label every error.
+        run_id = _strict_str(row["run_id"], what="run_id", run_id="<unknown>")
+
+        # Scalar columns must keep their declared integer/string shape. SQLite
+        # is dynamically typed, so a tampered row could carry floats or text.
+        start_minute_utc = _strict_int(
+            row["start_minute_utc"], what="start_minute_utc", run_id=run_id
+        )
+        minute_count = _strict_int(
+            row["minute_count"], what="minute_count", run_id=run_id
+        )
+        band_low = _strict_int(
+            row["band_low_tenths_c"], what="band_low_tenths_c", run_id=run_id
+        )
+        band_high = _strict_int(
+            row["band_high_tenths_c"], what="band_high_tenths_c", run_id=run_id
+        )
+        tolerance = _strict_int(
+            row["tolerance_tenths_c"], what="tolerance_tenths_c", run_id=run_id
+        )
+        max_retained = _strict_int(
+            row["max_retained_points"], what="max_retained_points", run_id=run_id
+        )
+        retained_count = _strict_int(
+            row["retained_count"], what="retained_count", run_id=run_id
+        )
+        digest = _strict_str(
+            row["payload_sha256"], what="payload_sha256", run_id=run_id
+        )
+        planner_version = _strict_str(
+            row["planner_version"], what="planner_version", run_id=run_id
+        )
+        created_at_utc = _strict_str(
+            row["created_at_utc"], what="created_at_utc", run_id=run_id
+        )
+        if not _SHA256_RE.match(digest):
+            raise ArchiveCorrupt(
+                f"archive {run_id!r} has a malformed payload_sha256"
+            )
+        if start_minute_utc < 0:
+            raise ArchiveCorrupt(
+                f"archive {run_id!r} has a negative start_minute_utc"
+            )
+        if tolerance < 0 or max_retained < 0 or retained_count < 0:
+            raise ArchiveCorrupt(
+                f"archive {run_id!r} has a negative count or tolerance field"
+            )
+
         try:
             retained_raw = json.loads(row["retained_points_json"])
             missing_raw = json.loads(row["missing_ranges_json"])
         except (TypeError, ValueError) as exc:
             raise ArchiveCorrupt(
-                f"archive {row['run_id']!r} has unreadable JSON payload"
+                f"archive {run_id!r} has unreadable JSON payload"
             ) from exc
+
+        # Exact integer format: floats (e.g. 780.5) and booleans are rejected
+        # rather than coerced, and every entry must be a two-element array.
+        retained_pairs = _load_int_pair_list(
+            retained_raw, what="retained_points", run_id=run_id
+        )
+        missing_pairs = _load_int_pair_list(
+            missing_raw, what="missing_ranges", run_id=run_id
+        )
 
         retained: list[tuple[int, int]] = []
-        try:
-            for item in retained_raw:
-                if len(item) != 2:
-                    raise ValueError("retained point must have two entries")
-                offset, value = int(item[0]), int(item[1])
-                retained.append((offset, value))
-            missing: list[tuple[int, int]] = []
-            for item in missing_raw:
-                if len(item) != 2:
-                    raise ValueError("missing range must have two entries")
-                start, length = int(item[0]), int(item[1])
-                missing.append((start, length))
-        except (TypeError, ValueError, IndexError) as exc:
-            raise ArchiveCorrupt(
-                f"archive {row['run_id']!r} has malformed point data"
-            ) from exc
+        seen_offsets: set[int] = set()
+        previous_offset = -1
+        for offset, value in retained_pairs:
+            if not 0 <= offset < minute_count:
+                raise ArchiveCorrupt(
+                    f"archive {run_id!r} has an out-of-range retained offset"
+                )
+            if not _MIN_TENTHS_C <= value <= _MAX_TENTHS_C:
+                raise ArchiveCorrupt(
+                    f"archive {run_id!r} has an out-of-range retained value"
+                )
+            if offset in seen_offsets:
+                raise ArchiveCorrupt(
+                    f"archive {run_id!r} has duplicate retained offsets"
+                )
+            seen_offsets.add(offset)
+            if offset <= previous_offset:
+                raise ArchiveCorrupt(
+                    f"archive {run_id!r} retained points are not strictly ordered"
+                )
+            previous_offset = offset
+            retained.append((offset, value))
 
+        # Missing ranges: [offset, length], sorted, non-overlapping, inside the
+        # run, each covering at least one minute.
+        cursor = 0
+        for start, length in missing_pairs:
+            if start < cursor or length <= 0 or start + length > minute_count:
+                raise ArchiveCorrupt(
+                    f"archive {run_id!r} has inconsistent missing-minute ranges"
+                )
+            cursor = start + length
+
+        missing = [(start, length) for start, length in missing_pairs]
+
+        # Checksum first: a payload that does not match its stored digest is
+        # tampered even when its shape happens to parse cleanly.
         expected = payload_digest(
-            run_id=row["run_id"],
-            start_minute_utc=row["start_minute_utc"],
-            minute_count=row["minute_count"],
-            band_low=row["band_low_tenths_c"],
-            band_high=row["band_high_tenths_c"],
-            tolerance=row["tolerance_tenths_c"],
-            max_retained=row["max_retained_points"],
+            run_id=run_id,
+            start_minute_utc=start_minute_utc,
+            minute_count=minute_count,
+            band_low=band_low,
+            band_high=band_high,
+            tolerance=tolerance,
+            max_retained=max_retained,
             retained_points=retained,
             missing_ranges=missing,
         )
-        if expected != row["payload_sha256"]:
+        if expected != digest:
             raise ArchiveCorrupt(
-                f"archive {row['run_id']!r} failed its integrity checksum"
+                f"archive {run_id!r} failed its integrity checksum"
             )
-        if len(retained) != row["retained_count"]:
+        if len(retained) != retained_count:
             raise ArchiveCorrupt(
-                f"archive {row['run_id']!r} retained count does not match payload"
+                f"archive {run_id!r} retained count does not match payload"
             )
-        if len(retained) > row["max_retained_points"]:
+        if len(retained) > max_retained:
             raise ArchiveCorrupt(
-                f"archive {row['run_id']!r} exceeds its own retained-point limit"
+                f"archive {run_id!r} exceeds its own retained-point limit"
             )
 
         archive = StoredArchive(
-            run_id=row["run_id"],
-            start_minute_utc=row["start_minute_utc"],
-            minute_count=row["minute_count"],
-            band_low_tenths_c=row["band_low_tenths_c"],
-            band_high_tenths_c=row["band_high_tenths_c"],
-            tolerance_tenths_c=row["tolerance_tenths_c"],
-            max_retained_points=row["max_retained_points"],
-            retained_count=row["retained_count"],
+            run_id=run_id,
+            start_minute_utc=start_minute_utc,
+            minute_count=minute_count,
+            band_low_tenths_c=band_low,
+            band_high_tenths_c=band_high,
+            tolerance_tenths_c=tolerance,
+            max_retained_points=max_retained,
+            retained_count=retained_count,
             retained_points=tuple(retained),
             missing_ranges=tuple(missing),
-            payload_sha256=row["payload_sha256"],
-            planner_version=row["planner_version"],
-            created_at_utc=row["created_at_utc"],
+            payload_sha256=digest,
+            planner_version=planner_version,
+            created_at_utc=created_at_utc,
         )
         self._validate_structure(archive)
         return archive
@@ -485,16 +639,54 @@ class ArchiveStore:
             return None
         return self._row_to_archive(row)
 
-    def list_recent(self, limit: int = 50) -> list[StoredArchive]:
+    def list_recent(self, limit: int = 50) -> RecentArchives:
+        """List the newest intact archives from a single committed snapshot.
+
+        Rows are streamed in list order (``created_at_utc`` newest first,
+        ``run_id`` ascending on ties) inside one read transaction, so archives
+        and skipped ids always describe the same committed data even when
+        writes interleave.  A corrupt row is skipped and its run id recorded
+        instead of failing the whole list; scanning stops as soon as ``limit``
+        intact archives are collected, so the full table's compressed payloads
+        are never loaded at once.  If fewer than ``limit`` intact archives
+        exist, every available intact archive is returned.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
         connection = self._connect()
+        archives: list[StoredArchive] = []
+        skipped: list[str] = []
+        exhausted = True
         try:
-            rows = connection.execute(
+            # A deferred read transaction pins one snapshot for the whole scan.
+            connection.execute("BEGIN")
+            cursor = connection.execute(
                 "SELECT * FROM furnace_archives ORDER BY created_at_utc DESC, "
-                "run_id ASC LIMIT ?",
-                (limit,),
-            ).fetchall()
+                "run_id ASC"
+            )
+            try:
+                for row in cursor:
+                    try:
+                        archives.append(self._row_to_archive(row))
+                    except ArchiveCorrupt:
+                        skipped.append(
+                            _corrupt_run_id(row["run_id"])
+                        )
+                        continue
+                    if len(archives) >= limit:
+                        exhausted = False
+                        break
+            finally:
+                cursor.close()
+            connection.execute("COMMIT")
         except sqlite3.Error as exc:
+            self._safe_rollback(connection)
             raise ArchiveUnavailable(f"failed to list archives: {exc}") from exc
         finally:
             connection.close()
-        return [self._row_to_archive(row) for row in rows]
+        return RecentArchives(
+            archives=tuple(archives),
+            skipped_run_ids=tuple(skipped),
+            limit=limit,
+            exhausted=exhausted,
+        )

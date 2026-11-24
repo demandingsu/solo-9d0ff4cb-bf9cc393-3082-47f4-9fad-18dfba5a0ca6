@@ -373,3 +373,440 @@ def test_unreachable_database_reports_unavailable(
     )
     assert queried.status_code == 503
     assert queried.json()["reason_code"] == "archive_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Corrupt-archive hardening: exact integer format and structural validation
+# ---------------------------------------------------------------------------
+
+
+def _raw_row(store_path: str, run_id: str) -> sqlite3.Row:
+    connection = sqlite3.connect(store_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        return connection.execute(
+            "SELECT * FROM furnace_archives WHERE run_id = ?", (run_id,)
+        ).fetchone()
+    finally:
+        connection.close()
+
+
+def _execute(store_path: str, statement: str, params: tuple[Any, ...] = ()) -> None:
+    connection = sqlite3.connect(store_path)
+    try:
+        connection.execute(statement, params)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_decimal_retained_point_is_rejected_not_truncated(
+    client: TestClient, store_path: str
+) -> None:
+    # A retained value of 700.5 must never be read as the integer 700. The
+    # tampered row keeps the original (integer) checksum, which the old code
+    # accepted after silently truncating the float.
+    assert client.post("/api/v1/archives", json=_payload()).status_code == 201
+    row = _raw_row(store_path, "HT-2026-0042")
+    points = json.loads(row["retained_points_json"])
+    original_value = points[0][1]
+    points[0][1] = original_value + 0.5
+    _execute(
+        store_path,
+        "UPDATE furnace_archives SET retained_points_json = ? WHERE run_id = ?",
+        (json.dumps(points), "HT-2026-0042"),
+    )
+
+    detail = client.get("/api/v1/archives/HT-2026-0042")
+    assert detail.status_code == 500
+    assert detail.json()["reason_code"] == "archive_corrupt"
+
+    minutes = client.get(
+        "/api/v1/archives/HT-2026-0042/minutes",
+        params={"start_minute_utc": 29_000_000, "end_minute_utc": 29_000_007},
+    )
+    assert minutes.status_code == 500
+    assert minutes.json()["reason_code"] == "archive_corrupt"
+
+
+def test_decimal_missing_range_length_is_rejected(
+    client: TestClient, store_path: str
+) -> None:
+    readings = [800, 800, None, None, 800, 800, 800]
+    assert (
+        client.post(
+            "/api/v1/archives",
+            json=_payload(run_id="HT-GAP", readings=readings, max_retained_points=10),
+        ).status_code
+        == 201
+    )
+    row = _raw_row(store_path, "HT-GAP")
+    ranges = json.loads(row["missing_ranges_json"])
+    # Keep the original checksum: old code truncated 2.5 to 2 and accepted it.
+    ranges[0][1] = ranges[0][1] + 0.5
+    _execute(
+        store_path,
+        "UPDATE furnace_archives SET missing_ranges_json = ? WHERE run_id = ?",
+        (json.dumps(ranges), "HT-GAP"),
+    )
+
+    response = client.get("/api/v1/archives/HT-GAP")
+    assert response.status_code == 500
+    assert response.json()["reason_code"] == "archive_corrupt"
+
+
+def test_boolean_retained_value_is_rejected(
+    client: TestClient, store_path: str
+) -> None:
+    assert client.post(
+        "/api/v1/archives",
+        json=_payload(run_id="HT-BOOL", readings=[1, 2, 3], max_retained_points=3),
+    ).status_code == 201
+    row = _raw_row(store_path, "HT-BOOL")
+    points = json.loads(row["retained_points_json"])
+    points[0][1] = True
+    # Recompute the digest over the boolean payload so only the type check can
+    # catch the tampering.
+    digest = db.payload_digest(
+        run_id="HT-BOOL",
+        start_minute_utc=row["start_minute_utc"],
+        minute_count=row["minute_count"],
+        band_low=row["band_low_tenths_c"],
+        band_high=row["band_high_tenths_c"],
+        tolerance=row["tolerance_tenths_c"],
+        max_retained=row["max_retained_points"],
+        retained_points=points,
+        missing_ranges=json.loads(row["missing_ranges_json"]),
+    )
+    _execute(
+        store_path,
+        "UPDATE furnace_archives SET retained_points_json = ?, "
+        "payload_sha256 = ? WHERE run_id = ?",
+        (json.dumps(points), digest, "HT-BOOL"),
+    )
+
+    response = client.get("/api/v1/archives/HT-BOOL")
+    assert response.status_code == 500
+    assert response.json()["reason_code"] == "archive_corrupt"
+
+
+def test_malformed_json_payload_is_corrupt(
+    client: TestClient, store_path: str
+) -> None:
+    assert client.post(
+        "/api/v1/archives", json=_payload(run_id="HT-BROKEN-JSON")
+    ).status_code == 201
+    _execute(
+        store_path,
+        "UPDATE furnace_archives SET retained_points_json = 'not-json' "
+        "WHERE run_id = ?",
+        ("HT-BROKEN-JSON",),
+    )
+    response = client.get("/api/v1/archives/HT-BROKEN-JSON")
+    assert response.status_code == 500
+    assert response.json()["reason_code"] == "archive_corrupt"
+
+
+def test_malformed_point_structure_is_corrupt(
+    client: TestClient, store_path: str
+) -> None:
+    assert client.post(
+        "/api/v1/archives", json=_payload(run_id="HT-SHAPE")
+    ).status_code == 201
+    row = _raw_row(store_path, "HT-SHAPE")
+    points = json.loads(row["retained_points_json"])
+    points.append([1, 2, 3])  # entries must be two-element arrays
+    digest = db.payload_digest(
+        run_id="HT-SHAPE",
+        start_minute_utc=row["start_minute_utc"],
+        minute_count=row["minute_count"],
+        band_low=row["band_low_tenths_c"],
+        band_high=row["band_high_tenths_c"],
+        tolerance=row["tolerance_tenths_c"],
+        max_retained=row["max_retained_points"],
+        retained_points=points,
+        missing_ranges=json.loads(row["missing_ranges_json"]),
+    )
+    _execute(
+        store_path,
+        "UPDATE furnace_archives SET retained_points_json = ?, "
+        "payload_sha256 = ? WHERE run_id = ?",
+        (json.dumps(points), digest, "HT-SHAPE"),
+    )
+    response = client.get("/api/v1/archives/HT-SHAPE")
+    assert response.status_code == 500
+    assert response.json()["reason_code"] == "archive_corrupt"
+
+
+def test_overlapping_missing_ranges_are_corrupt(
+    client: TestClient, store_path: str
+) -> None:
+    assert client.post(
+        "/api/v1/archives",
+        json=_payload(
+            run_id="HT-OVERLAP",
+            readings=[800, None, None, 800],
+            max_retained_points=4,
+        ),
+    ).status_code == 201
+    row = _raw_row(store_path, "HT-OVERLAP")
+    bad_ranges = [[1, 2], [2, 1]]  # second range starts inside the first
+    digest = db.payload_digest(
+        run_id="HT-OVERLAP",
+        start_minute_utc=row["start_minute_utc"],
+        minute_count=row["minute_count"],
+        band_low=row["band_low_tenths_c"],
+        band_high=row["band_high_tenths_c"],
+        tolerance=row["tolerance_tenths_c"],
+        max_retained=row["max_retained_points"],
+        retained_points=json.loads(row["retained_points_json"]),
+        missing_ranges=bad_ranges,
+    )
+    _execute(
+        store_path,
+        "UPDATE furnace_archives SET missing_ranges_json = ?, "
+        "payload_sha256 = ? WHERE run_id = ?",
+        (json.dumps(bad_ranges), digest, "HT-OVERLAP"),
+    )
+    response = client.get("/api/v1/archives/HT-OVERLAP")
+    assert response.status_code == 500
+    assert response.json()["reason_code"] == "archive_corrupt"
+
+
+def test_malformed_checksum_string_is_corrupt(
+    client: TestClient, store_path: str
+) -> None:
+    assert client.post(
+        "/api/v1/archives", json=_payload(run_id="HT-BAD-DIGEST")
+    ).status_code == 201
+    _execute(
+        store_path,
+        "UPDATE furnace_archives SET payload_sha256 = 'not-a-sha256' "
+        "WHERE run_id = ?",
+        ("HT-BAD-DIGEST",),
+    )
+    response = client.get("/api/v1/archives/HT-BAD-DIGEST")
+    assert response.status_code == 500
+    assert response.json()["reason_code"] == "archive_corrupt"
+
+
+def test_float_scalar_column_is_corrupt(client: TestClient, store_path: str) -> None:
+    assert client.post(
+        "/api/v1/archives", json=_payload(run_id="HT-FLOAT-COL")
+    ).status_code == 201
+    _execute(
+        store_path,
+        "UPDATE furnace_archives SET minute_count = 8.5 WHERE run_id = ?",
+        ("HT-FLOAT-COL",),
+    )
+    response = client.get("/api/v1/archives/HT-FLOAT-COL")
+    assert response.status_code == 500
+    assert response.json()["reason_code"] == "archive_corrupt"
+
+
+# ---------------------------------------------------------------------------
+# List endpoint: corrupt rows are skipped and reported, never fail the list
+# ---------------------------------------------------------------------------
+
+
+def test_list_skips_corrupt_archives_and_reports_their_run_ids(
+    client: TestClient, store_path: str
+) -> None:
+    for run_id in ("GOOD-1", "BAD-1", "GOOD-2"):
+        assert (
+            client.post("/api/v1/archives", json=_payload(run_id=run_id)).status_code
+            == 201
+        )
+    # Distinct ingest timestamps, GOOD-2 newest and BAD-1 in the middle.
+    stamps = {
+        "GOOD-1": "2026-11-24T00:00:01+00:00",
+        "BAD-1": "2026-11-24T00:00:02+00:00",
+        "GOOD-2": "2026-11-24T00:00:03+00:00",
+    }
+    for run_id, stamp in stamps.items():
+        _execute(
+            store_path,
+            "UPDATE furnace_archives SET created_at_utc = ? WHERE run_id = ?",
+            (stamp, run_id),
+        )
+    _execute(
+        store_path,
+        "UPDATE furnace_archives SET retained_count = 999 WHERE run_id = 'BAD-1'",
+    )
+
+    response = client.get("/api/v1/archives", params={"limit": 50})
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["run_id"] for item in body["archives"]] == ["GOOD-2", "GOOD-1"]
+    assert body["skipped_corrupt_run_ids"] == ["BAD-1"]
+    assert body["available_exhausted"] is True
+    assert body["limit"] == 50
+
+
+def test_list_returns_all_available_when_limit_not_reached(
+    client: TestClient, store_path: str
+) -> None:
+    for run_id in ("GOOD-1", "BAD-1", "BAD-2"):
+        assert (
+            client.post("/api/v1/archives", json=_payload(run_id=run_id)).status_code
+            == 201
+        )
+    stamps = {
+        "GOOD-1": "2026-11-24T00:00:01+00:00",
+        "BAD-1": "2026-11-24T00:00:02+00:00",
+        "BAD-2": "2026-11-24T00:00:03+00:00",
+    }
+    for run_id, stamp in stamps.items():
+        _execute(
+            store_path,
+            "UPDATE furnace_archives SET created_at_utc = ? WHERE run_id = ?",
+            (stamp, run_id),
+        )
+    for bad in ("BAD-1", "BAD-2"):
+        _execute(
+            store_path,
+            "UPDATE furnace_archives SET retained_count = 999 WHERE run_id = ?",
+            (bad,),
+        )
+
+    response = client.get("/api/v1/archives", params={"limit": 10})
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["run_id"] for item in body["archives"]] == ["GOOD-1"]
+    assert body["skipped_corrupt_run_ids"] == ["BAD-2", "BAD-1"]
+    assert body["available_exhausted"] is True
+
+
+def test_list_tie_breaks_same_ingest_time_by_run_id(
+    client: TestClient, store_path: str
+) -> None:
+    for run_id in ("RUN-C", "RUN-A", "RUN-B"):
+        assert (
+            client.post("/api/v1/archives", json=_payload(run_id=run_id)).status_code
+            == 201
+        )
+    # Force an identical ingest timestamp so ordering relies on run_id only.
+    _execute(
+        store_path,
+        "UPDATE furnace_archives SET created_at_utc = '2026-11-24T00:00:00+00:00'",
+    )
+
+    response = client.get("/api/v1/archives")
+    assert response.status_code == 200
+    assert [item["run_id"] for item in response.json()["archives"]] == [
+        "RUN-A",
+        "RUN-B",
+        "RUN-C",
+    ]
+
+
+def test_list_stops_scanning_once_limit_intact_archives_found(
+    client: TestClient, store_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for index in range(8):
+        assert (
+            client.post(
+                "/api/v1/archives", json=_payload(run_id=f"RUN-{index:02d}")
+            ).status_code
+            == 201
+        )
+    # Deterministic newest-first order, RUN-07 newest, RUN-00 oldest.
+    for index in range(8):
+        _execute(
+            store_path,
+            "UPDATE furnace_archives SET created_at_utc = ? WHERE run_id = ?",
+            (f"2026-11-24T00:00:{10 + index:02d}+00:00", f"RUN-{index:02d}"),
+        )
+    # Two corrupt rows interspersed in list order.
+    _execute(
+        store_path,
+        "UPDATE furnace_archives SET retained_count = 999 "
+        "WHERE run_id IN ('RUN-07', 'RUN-05')",
+    )
+
+    calls: list[str] = []
+    original = db.ArchiveStore._row_to_archive
+
+    def tracking(self: db.ArchiveStore, row: sqlite3.Row) -> db.StoredArchive:
+        calls.append(row["run_id"])
+        return original(self, row)
+
+    monkeypatch.setattr(db.ArchiveStore, "_row_to_archive", tracking)
+
+    response = client.get("/api/v1/archives", params={"limit": 3})
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["archives"]) == 3
+    assert body["available_exhausted"] is False
+    # Only the rows needed to collect three intact archives were parsed; the
+    # older half of the table was never loaded.
+    assert calls == ["RUN-07", "RUN-06", "RUN-05", "RUN-04", "RUN-03"]
+    assert body["skipped_corrupt_run_ids"] == ["RUN-07", "RUN-05"]
+
+
+def test_list_reads_one_snapshot_when_inserts_interleave(
+    client: TestClient, store_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for run_id in ("RUN-1", "RUN-2", "RUN-3"):
+        assert (
+            client.post("/api/v1/archives", json=_payload(run_id=run_id)).status_code
+            == 201
+        )
+    stamps = {
+        "RUN-1": "2026-11-24T00:00:01+00:00",
+        "RUN-2": "2026-11-24T00:00:02+00:00",
+        "RUN-3": "2026-11-24T00:00:03+00:00",
+    }
+    for run_id, stamp in stamps.items():
+        _execute(
+            store_path,
+            "UPDATE furnace_archives SET created_at_utc = ? WHERE run_id = ?",
+            (stamp, run_id),
+        )
+
+    original = db.ArchiveStore._row_to_archive
+    inserted: dict[str, bool] = {"done": False}
+
+    def inserting_reader(
+        self: db.ArchiveStore, row: sqlite3.Row
+    ) -> db.StoredArchive:
+        archive = original(self, row)
+        # A concurrent commit lands while the list scan is in progress.
+        if not inserted["done"]:
+            inserted["done"] = True
+            self.insert(
+                run_id="RUN-LATE",
+                start_minute_utc=29_000_000,
+                minute_count=4,
+                band_low_tenths_c=780,
+                band_high_tenths_c=820,
+                tolerance_tenths_c=5,
+                max_retained_points=4,
+                retained_points=((0, 800), (3, 800)),
+                missing_ranges=(),
+            )
+        return archive
+
+    monkeypatch.setattr(db.ArchiveStore, "_row_to_archive", inserting_reader)
+
+    response = client.get("/api/v1/archives", params={"limit": 50})
+    assert response.status_code == 200
+    run_ids = [item["run_id"] for item in response.json()["archives"]]
+    # The late commit is not part of the snapshot this list was built from.
+    assert "RUN-LATE" not in run_ids
+    assert run_ids == ["RUN-3", "RUN-2", "RUN-1"]
+
+    # A subsequent list, on a fresh snapshot, does see the committed archive.
+    follow_up = client.get("/api/v1/archives")
+    assert "RUN-LATE" in [item["run_id"] for item in follow_up.json()["archives"]]
+
+
+def test_list_with_unreadable_database_reports_unavailable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    monkeypatch.setenv("FURNACE_DB_PATH", str(blocked))
+    response = client.get("/api/v1/archives")
+    assert response.status_code == 503
+    assert response.json()["reason_code"] == "archive_unavailable"

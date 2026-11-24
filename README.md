@@ -28,7 +28,7 @@ FURNACE_DB_PATH=./data/furnace_archive.sqlite3 \
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/v1/archives` | 压缩一个炉次并整炉入档；无解或写入失败返回原因 |
-| `GET` | `/api/v1/archives` | 列出已归档炉次（最新在前） |
+| `GET` | `/api/v1/archives` | 列出已归档炉次（最新在前）；坏档自动跳过并在响应中列出其炉次号 |
 | `GET` | `/api/v1/archives/{run_id}` | 归档元数据与留点数 |
 | `GET` | `/api/v1/archives/{run_id}/minutes?start_minute_utc=&end_minute_utc=` | 区间内的复原炉温、缺测分钟、温区内连续时段 |
 | `GET` | `/health` | 数据库可达性 |
@@ -66,6 +66,21 @@ curl -s 'http://localhost:8000/api/v1/archives/HT-2026-0042/minutes?start_minute
 区间内的 `in_band_intervals` 返回**所有与查询区间相交**的完整时段，不会被查询边界截断，因此可以直接读出一次保温持续了多久；缺测分钟会打断时段。
 查询区间必须落在该炉次范围内，否则返回 `416`。
 
+### 清单与坏档
+
+```bash
+curl -s 'http://localhost:8000/api/v1/archives?limit=50'
+```
+
+返回：
+
+- `archives[]`：按入档时间从新到旧、同时间按炉次号升序排列的可用档案摘要，最多 `limit` 条；
+- `skipped_corrupt_run_ids[]`：为凑齐结果而跳过的坏档炉次号，顺序与扫描顺序一致；
+- `available_exhausted`：`true` 表示全库已扫描完（可用档案不足 `limit` 条，已全部返回），`false` 表示收满 `limit` 条后提前停止；
+- `limit`：本次请求的页大小。
+
+坏档不会让清单整体失败；但单炉详情（`GET /api/v1/archives/{run_id}`）与分钟查询遇到坏档仍返回 `500 archive_corrupt`。
+
 ## 压缩规则与保证
 
 1. **每段连续实测数据保留首尾**：缺测会把炉次切成若干连续实测段，每段首、尾采样点必须留点。
@@ -78,7 +93,8 @@ curl -s 'http://localhost:8000/api/v1/archives/HT-2026-0042/minutes?start_minute
 6. **整炉入档**：任意一段无解即整炉不入档；成功时整炉一次性写入。
 7. **只存压缩档**：SQLite 中只保存留点（分钟偏移 + 原值）、缺测区间、参数与 SHA-256 校验和，不保存原始逐分钟序列。
 8. **写入原子性**：使用 `BEGIN IMMEDIATE` 事务，失败完整回滚；已归档数据不受影响，照常可查。
-9. **读档完整性**：每次读取会校验 SHA-256、留点数、段首尾留点与可重建性；被篡改的归档返回 `500 archive_corrupt`，不会影响其他归档的查询。
+9. **读档完整性**：每次读取都会先做严格的格式与结构校验，再校验 SHA-256。标量列必须是真正的整数（拒绝 `780.5` 这类小数、`true` 这类布尔值，绝不做静默取整）与非空字符串；留点和缺测区间必须是“两个整数组成的数组”，留点偏移严格递增、不重复且落在炉次范围内，缺测区间按偏移有序、互不重叠且不越界。随后还会校验留点数、段首尾留点与可重建性。被篡改的归档在详情和分钟查询上返回 `500 archive_corrupt`，不会影响其他归档的查询。
+10. **清单容错与一致性**：`GET /api/v1/archives` 不再因单个坏档整张报错。它在**一个只读事务（同一份已提交快照）**内按 `created_at_utc` 从新到旧、同时间按炉次号升序**流式**扫描，逐行做第 9 条的完整校验：通过校验的记录收满 `limit` 条即停止（不会一次性装入全库压缩内容），坏档则跳过并把炉次号记入 `skipped_corrupt_run_ids`；若通过校验的记录不足 `limit`，则返回全部可用档案，`available_exhausted=true`。入档与查清单交错时，清单内容与跳过项始终来自同一份已提交数据，扫描期间新提交的炉次只会出现在下一次查询里。数据库本身不可读时仍返回 `503 archive_unavailable`。
 
 ## 错误与状态码
 
@@ -92,7 +108,7 @@ curl -s 'http://localhost:8000/api/v1/archives/HT-2026-0042/minutes?start_minute
 | `416` | `range_outside_run` | 查询区间超出该炉次范围 |
 | `503` | `archive_write_failed` | 写入失败（`retryable` 指示可否重试） |
 | `503` | `archive_unavailable` | 数据库不可达/不可打开 |
-| `500` | `archive_corrupt` | 归档校验失败 |
+| `500` | `archive_corrupt` | 归档校验失败（详情/分钟查询）；清单接口会跳过坏档并在 `skipped_corrupt_run_ids` 中列出 |
 
 ## 测试
 
@@ -101,7 +117,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-测试覆盖：规划器与穷举最优解对比、误差/温区/首尾留点约束、缺测不桥接、上限剔除原因、入库只存压缩档、重复炉次、写入失败后旧归档仍可查、篡改检测、区间与缺测标记。
+测试覆盖：规划器与穷举最优解对比、误差/温区/首尾留点约束、缺测不桥接、上限剔除原因、入库只存压缩档、重复炉次、写入失败后旧归档仍可查、篡改检测（小数/布尔/坏 JSON/坏结构/重叠缺测区间/坏摘要）、清单跳过坏档并报告炉次号、清单同秒按炉次号排序、凑满 limit 提前停止、入档交错下的快照一致性、区间与缺测标记。
 
 ## 结构
 

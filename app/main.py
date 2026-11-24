@@ -291,20 +291,14 @@ def create_app() -> FastAPI:
         "/archives",
         response_model=ArchiveListResponse,
         tags=["archive"],
-        summary="List archived runs, newest first",
+        summary="List archived runs, newest first, skipping corrupt archives",
     )
     def list_archives(
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
     ) -> ArchiveListResponse:
         store = db.ArchiveStore(_store_path())
         try:
-            archives = store.list_recent(limit)
-        except db.ArchiveCorrupt as exc:
-            raise ApiError(
-                status.HTTP_500_INTERNAL_SERVER_ERROR,
-                "archive_corrupt",
-                f"archive store is unreadable: {exc}",
-            ) from exc
+            result = store.list_recent(limit)
         except db.ArchiveUnavailable as exc:
             raise ApiError(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -322,8 +316,11 @@ def create_app() -> FastAPI:
                     retained_points_count=item.retained_count,
                     created_at_utc=item.created_at_utc,
                 )
-                for item in archives
-            ]
+                for item in result.archives
+            ],
+            skipped_corrupt_run_ids=list(result.skipped_run_ids),
+            limit=result.limit,
+            available_exhausted=result.exhausted,
         )
 
     @api.get(

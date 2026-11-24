@@ -143,6 +143,20 @@ class ArchiveListItem(BaseModel):
 
 class ArchiveListResponse(BaseModel):
     archives: list[ArchiveListItem]
+    skipped_corrupt_run_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Run ids of corrupt archives skipped while collecting this page, "
+            "in list order (newest first, run id on ties)."
+        ),
+    )
+    limit: int = Field(description="Requested page size.")
+    available_exhausted: bool = Field(
+        description=(
+            "True when every archive in the store was scanned; False when the "
+            "page stopped early because limit intact archives were found."
+        )
+    )
 
 
 class ErrorResponse(BaseModel):
