@@ -1,0 +1,15 @@
+services:
+  furnace-archive:
+    build: .
+    image: furnace-archive:latest
+    container_name: furnace-archive
+    ports:
+      - "8000:8000"
+    environment:
+      FURNACE_DB_PATH: /data/furnace_archive.sqlite3
+    volumes:
+      - furnace-data:/data
+    restart: unless-stopped
+
+volumes:
+  furnace-data:
